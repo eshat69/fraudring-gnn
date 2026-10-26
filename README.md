@@ -1,5 +1,7 @@
+https://fraudring-gnn.onrender.com/
 
 # FraudRing GNN: Illicit Wallet Detection
+
 
 This project compares traditional machine-learning and graph neural network (GNN) models for detecting illicit cryptocurrency wallets using wallet graph features.
 
