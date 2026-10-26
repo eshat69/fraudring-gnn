@@ -8,6 +8,7 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# Load prediction data
 df = pd.read_csv(BASE_DIR / "gnn_test_predictions.csv")
 
 with open(BASE_DIR / "best_model.json", encoding="utf-8") as f:
@@ -22,13 +23,22 @@ columns = {
     "XGBoost": "prob_xgboost",
 }
 
-score_col = columns[model]
+score_col = columns.get(model, "prob_graphsage")
+
 address_col = next(
-    c for c in ["address", "wallet_address", "wallet"] if c in df.columns
+    (c for c in ["address", "wallet_address", "wallet"]
+     if c in df.columns),
+    None,
 )
 
+if address_col is None:
+    raise ValueError("No wallet address column found in CSV.")
+
+if score_col not in df.columns:
+    raise ValueError(f"Missing prediction column: {score_col}")
+
 df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
-df = df.dropna(subset=[score_col])
+df = df.dropna(subset=[score_col]).copy()
 
 df["Risk Score"] = df[score_col]
 df["Suggestion"] = df["Risk Score"].apply(
@@ -46,23 +56,94 @@ results = (
     else pd.DataFrame({"Message": ["No model results available."]})
 )
 
+
+def check_wallet(wallet):
+    wallet = (wallet or "").strip()
+
+    if not wallet:
+        return "Please enter a wallet address.", None
+
+    match = df[
+        df[address_col].astype(str).str.strip().str.lower()
+        == wallet.lower()
+    ]
+
+    if match.empty:
+        return (
+            "Wallet not found in the available prediction dataset. "
+            "This app currently checks existing predictions only.",
+            None,
+        )
+
+    row = match.iloc[0]
+    score = float(row["Risk Score"])
+    prediction = row["Suggestion"]
+
+    output = pd.DataFrame([{
+        "Wallet Address": str(row[address_col]),
+        "Risk Score": round(score, 4),
+        "Risk Percentage": f"{score * 100:.2f}%",
+        "Prediction": prediction,
+        "Threshold": threshold,
+        "Model": model,
+    }])
+
+    message = (
+        f"### {prediction}\n"
+        f"**Risk score:** {score:.4f} ({score * 100:.2f}%)\n\n"
+        f"**Model:** {model}\n\n"
+        + (
+            "Suggestion: Review this wallet for potential suspicious activity."
+            if score >= threshold
+            else "Suggestion: No flag triggered by the current model threshold."
+        )
+    )
+
+    return message, output
+
+
 with gr.Blocks(title="FraudRing-GNN") as demo:
     gr.Markdown("# FraudRing-GNN")
-    gr.Markdown("### Wallet Suggestions")
+    gr.Markdown("Wallet fraud-risk prediction and review")
 
+    with gr.Group():
+        gr.Markdown("### Check a Wallet")
+        wallet_input = gr.Textbox(
+            label="Wallet Address",
+            placeholder="Enter a wallet address from the prediction dataset",
+        )
+        check_button = gr.Button("Check Wallet", variant="primary")
+        prediction_output = gr.Markdown()
+        wallet_result = gr.Dataframe(
+            label="Prediction Result",
+            interactive=False,
+        )
+
+        check_button.click(
+            fn=check_wallet,
+            inputs=wallet_input,
+            outputs=[prediction_output, wallet_result],
+        )
+        wallet_input.submit(
+            fn=check_wallet,
+            inputs=wallet_input,
+            outputs=[prediction_output, wallet_result],
+        )
+
+    gr.Markdown("### Wallet Suggestions")
     gr.Dataframe(
         value=suggestions,
         interactive=False,
-        label="Wallet Risk Predictions",
+        label="All Wallet Predictions",
     )
 
     gr.Markdown("### Model Results")
-
     gr.Dataframe(
         value=results,
         interactive=False,
         label="Evaluation Results",
     )
+
 
 if __name__ == "__main__":
     demo.launch(
