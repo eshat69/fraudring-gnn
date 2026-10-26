@@ -1,83 +1,329 @@
 import json
 import os
+from pathlib import Path
 
 import gradio as gr
 import pandas as pd
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR = os.path.join(BASE_DIR, "outputs", "results")
 
-RESULTS_PATH = os.path.join(RESULTS_DIR, "final_results.csv")
-PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "gnn_test_predictions.csv")
-MODEL_INFO_PATH = os.path.join(RESULTS_DIR, "best_model.json")
+# -----------------------------
+# File paths
+# -----------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+PREDICTIONS_PATH = BASE_DIR / "gnn_test_predictions.csv"
+METADATA_PATH = BASE_DIR / "best_model.json"
+RESULTS_PATH = BASE_DIR / "final_results.csv"
+
+PLOTS_DIR = BASE_DIR / "plots"
+
+PLOT_FILES = {
+    "ROC and Precision-Recall curves": "results_roc_pr_curves.png",
+    "Confusion matrices": "results_confusion_matrices.png",
+    "Threshold sensitivity": "results_threshold_sensitivity.png",
+    "Cumulative gain / alert budget": "results_cumulative_gain.png",
+    "Illicit recall by wallet degree": "results_recall_by_degree.png",
+    "Training curves": "results_training_curves.png",
+    "XGBoost feature importance": "results_xgb_feature_importance.png",
+}
 
 
-def load_data():
-    results = pd.read_csv(RESULTS_PATH)
-    predictions = pd.read_csv(PREDICTIONS_PATH)
+# -----------------------------
+# Required-file validation
+# -----------------------------
 
-    with open(MODEL_INFO_PATH, "r") as f:
-        model_info = json.load(f)
+required_files = [PREDICTIONS_PATH, METADATA_PATH, RESULTS_PATH]
 
-    return results, predictions, model_info
+for path in required_files:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Required file not found: {path.name}. "
+            "Place it in the same folder as app.py."
+        )
 
 
-results_df, predictions_df, model_info = load_data()
+# -----------------------------
+# Load model metadata
+# -----------------------------
+
+with METADATA_PATH.open("r", encoding="utf-8") as file:
+    model_info = json.load(file)
 
 
-def search_wallet(wallet_address):
-    if not wallet_address:
-        return "Please enter a wallet address."
+MODEL_COLUMNS = {
+    "GraphSAGE": "prob_graphsage",
+    "GCN": "prob_gcn",
+    "XGBoost": "prob_xgboost",
+}
 
-    match = predictions_df[
-        predictions_df["address"].str.lower() == wallet_address.strip().lower()
-    ]
+model_name = model_info["best_model"]
 
-    if match.empty:
-        return "Wallet not found in the test-set predictions."
+if model_name not in MODEL_COLUMNS:
+    raise ValueError(f"Unsupported model: {model_name}")
 
-    row = match.iloc[0]
+score_column = MODEL_COLUMNS[model_name]
+threshold = float(model_info["threshold"])
 
-    return (
-        f"Wallet: {row['address']}\n"
-        f"True label: {'Illicit' if row['y_true'] == 1 else 'Licit'}\n"
-        f"XGBoost risk score: {row['prob_xgboost']:.4f}\n"
-        f"GCN risk score: {row['prob_gcn']:.4f}\n"
-        f"GraphSAGE risk score: {row['prob_graphsage']:.4f}"
+if not 0 <= threshold <= 1:
+    raise ValueError("The threshold must be between 0 and 1.")
+
+
+# -----------------------------
+# Load predictions and results
+# -----------------------------
+
+predictions = pd.read_csv(
+    PREDICTIONS_PATH,
+    dtype={"address": str},
+)
+
+results = pd.read_csv(RESULTS_PATH)
+
+required_columns = {"address", score_column}
+missing_columns = required_columns - set(predictions.columns)
+
+if missing_columns:
+    raise ValueError(
+        f"Missing columns in prediction CSV: {sorted(missing_columns)}. "
+        f"Available columns: {predictions.columns.tolist()}"
     )
 
+if predictions.empty:
+    raise ValueError("The prediction CSV is empty.")
 
-with gr.Blocks(title="FraudRing GNN") as demo:
+if predictions["address"].isna().any():
+    raise ValueError("The prediction CSV contains missing addresses.")
+
+predictions["address"] = predictions["address"].str.strip()
+
+if predictions["address"].eq("").any():
+    raise ValueError("The prediction CSV contains empty addresses.")
+
+if predictions["address"].duplicated().any():
+    raise ValueError("Duplicate wallet addresses found in prediction CSV.")
+
+predictions[score_column] = pd.to_numeric(
+    predictions[score_column],
+    errors="raise",
+)
+
+if not predictions[score_column].between(0, 1).all():
+    raise ValueError("Saved scores must be between 0 and 1.")
+
+wallet_lookup = predictions.set_index("address")
+
+
+# -----------------------------
+# Wallet lookup function
+# -----------------------------
+
+def lookup_wallet(address):
+    address = str(address or "").strip()
+
+    if not address:
+        return (
+            "Please enter a wallet address.",
+            "",
+            "",
+        )
+
+    if address not in wallet_lookup.index:
+        return (
+            "Wallet not found",
+            "",
+            "Only wallets in the saved test dataset are available. "
+            "Try one of the examples below.",
+        )
+
+    score = float(wallet_lookup.loc[address, score_column])
+
+    decision = (
+        "Flagged for illicit-activity review"
+        if score >= threshold
+        else "Not flagged at this threshold"
+    )
+
+    details = (
+        f"Model: {model_name}\n"
+        f"Decision threshold: {threshold:.6f}\n"
+        "Source: saved test-set prediction\n"
+        "This score is not proof of illicit activity."
+    )
+
+    return decision, f"{score:.6f}", details
+
+
+# -----------------------------
+# Examples
+# -----------------------------
+
+examples = [
+    [address]
+    for address in predictions["address"].head(5)
+]
+
+selection_method = str(
+    model_info.get("selected_by", "Not recorded")
+)
+
+
+# -----------------------------
+# Gradio interface
+# -----------------------------
+
+with gr.Blocks(
+    title="FraudRing-GNN",
+    theme=gr.themes.Soft(),
+) as demo:
+
     gr.Markdown(
         """
-        # FraudRing GNN
-        ### Illicit Cryptocurrency Wallet Detection
+        # FraudRing-GNN
 
-        Compare XGBoost, GCN, and GraphSAGE risk scores for wallets in the test set.
+        ### Wallet Risk — Saved Results Explorer
+
+        Explore previously computed model scores for Elliptic++ test wallets.
+        This demo does not perform live blockchain analysis or generate
+        predictions for new wallets.
         """
     )
 
-    with gr.Row():
-        wallet_input = gr.Textbox(
-            label="Wallet address",
-            placeholder="Enter a test-set wallet address",
-        )
-        search_button = gr.Button("Search")
-
-    output_box = gr.Textbox(label="Result", lines=8)
-
-    search_button.click(
-        fn=search_wallet,
-        inputs=wallet_input,
-        outputs=output_box,
+    gr.Markdown(
+        f"""
+        **Best model:** {model_name}  
+        **Available wallets:** {len(predictions):,}  
+        **Decision threshold:** {threshold:.6f}  
+        **Model-selection method:** {selection_method}
+        """
     )
 
-    gr.Markdown("### Final model comparison")
-    gr.Dataframe(value=results_df, interactive=False)
+    with gr.Tabs():
+
+        # ---------------------
+        # Wallet lookup
+        # ---------------------
+
+        with gr.Tab("Wallet lookup"):
+            wallet_input = gr.Textbox(
+                label="Bitcoin wallet address",
+                placeholder="Enter a wallet address or select an example",
+            )
+
+            search_button = gr.Button("Show saved result", variant="primary")
+
+            decision_output = gr.Textbox(
+                label="Model decision",
+                interactive=False,
+            )
+
+            score_output = gr.Textbox(
+                label="Saved illicit-class score",
+                interactive=False,
+            )
+
+            details_output = gr.Textbox(
+                label="Details",
+                lines=5,
+                interactive=False,
+            )
+
+            search_button.click(
+                fn=lookup_wallet,
+                inputs=wallet_input,
+                outputs=[
+                    decision_output,
+                    score_output,
+                    details_output,
+                ],
+            )
+
+            wallet_input.submit(
+                fn=lookup_wallet,
+                inputs=wallet_input,
+                outputs=[
+                    decision_output,
+                    score_output,
+                    details_output,
+                ],
+            )
+
+            gr.Examples(
+                examples=examples,
+                inputs=wallet_input,
+                label="Example wallets",
+            )
+
+        # ---------------------
+        # Model results
+        # ---------------------
+
+        with gr.Tab("Model results"):
+            gr.Markdown(
+                "### Offline experimental results\n"
+                "Comparison of XGBoost, GCN, and GraphSAGE on the held-out test set."
+            )
+
+            gr.Dataframe(
+                value=results,
+                interactive=False,
+                label="Final results",
+            )
+
+            gr.Markdown(
+                "These results describe the offline experiment, "
+                "not guaranteed live performance."
+            )
+
+        # ---------------------
+        # Plots
+        # ---------------------
+
+        with gr.Tab("Plots"):
+            gr.Markdown(
+                "### Evaluation plots\n"
+                "These plots were generated during the offline experiment."
+            )
+
+            available_plots = []
+
+            for title, filename in PLOT_FILES.items():
+                plot_path = PLOTS_DIR / filename
+
+                if plot_path.exists():
+                    available_plots.append((title, str(plot_path)))
+
+            if not available_plots:
+                gr.Markdown(
+                    "No plot images were found. Add the generated PNG files "
+                    "to a folder named `plots` in the repository root."
+                )
+            else:
+                for title, plot_path in available_plots:
+                    gr.Markdown(f"#### {title}")
+                    gr.Image(
+                        value=plot_path,
+                        show_label=False,
+                        interactive=False,
+                    )
+
+    gr.Markdown(
+        """
+        ---
+
+        **Research demonstration only.** A flagged wallet is not a verified
+        fraudster, and this app does not establish fraud-ring membership.
+        """
+    )
+
+
+# -----------------------------
+# Run app
+# -----------------------------
 
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
+        server_port=int(os.environ.get("PORT", 10000)),
         share=False,
     )
