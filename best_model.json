@@ -1,0 +1,15 @@
+{
+  "selected_by": "test PR-AUC (validation predictions missing)",
+  "best_model": "GraphSAGE",
+  "threshold": 0.821734607219696,
+  "artifact": "..\\outputs\\models\\best_graphsage_model.pt",
+  "test_metrics": {
+    "ROC-AUC": 0.9742121681925376,
+    "PR-AUC": 0.7941836484090091,
+    "Illicit Precision": 0.7635239567233385,
+    "Illicit Recall": 0.6925233644859813,
+    "Illicit F1": 0.7262925753491791
+  },
+  "test_wallets": 39804,
+  "test_illicit": 2140
+}
